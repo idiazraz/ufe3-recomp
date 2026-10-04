@@ -26,3 +26,7 @@ build/
 /erx/step2/out/
 /erx/step2/wrap/
 /erx/step2/cfg/
+
+# Extracted movies / reference frames are game content
+*.ipu
+/work/ipu_ref/ref_movie*/

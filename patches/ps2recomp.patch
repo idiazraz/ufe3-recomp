@@ -348,7 +348,7 @@ index b01a937..6e0da23 100644
          case SPECIAL_SYNC:
              return "// SYNC instruction - memory barrier\n// In recompiled code, we don't need explicit memory barriers";
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..1b7cd8a 100644
+index 589d768..15df947 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -402,6 +402,14 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -385,6 +385,18 @@ index 589d768..1b7cd8a 100644
  if(PS2X_ENABLE_RUNNER_PCH)
      set(PS2X_RUNNER_PCH_HEADERS
          "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+@@ -506,6 +526,11 @@ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+ )
+ 
++# GLFW (bundled inside raylib) for direct joystick/gamepad queries in ps2_pad.cpp.
++if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND DEFINED raylib_SOURCE_DIR)
++    target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external/glfw/include")
++endif()
++
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
 diff --git a/ps2xRuntime/include/ps2_debug_panel.h b/ps2xRuntime/include/ps2_debug_panel.h
 index b9933d5..839fafc 100644
 --- a/ps2xRuntime/include/ps2_debug_panel.h
@@ -508,6 +520,39 @@ index 4b9242c..94035af 100644
      void reportMissingFunction(uint8_t *rdram,
                                 R5900Context *ctx,
                                 uint32_t targetPc,
+diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
+index 7755fe6..662143d 100644
+--- a/ps2xRuntime/include/runtime/ps2_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_pad.h
+@@ -3,6 +3,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ 
+ class PSPadBackend
+ {
+@@ -11,6 +12,20 @@ public:
+     ~PSPadBackend() = default;
+ 
+     bool readState(int port, int slot, uint8_t *data, size_t size);
++
++    // Sample GLFW's gamepad state into a mutex-protected snapshot.
++    // GLFW joystick functions must be called on the main thread, while readState()
++    // runs on the guest GameThread, so pollMain() is called once per render frame.
++    void pollMain();
++
++private:
++    static constexpr int kGamepadButtonCount = 15; // GLFW_GAMEPAD_BUTTON_LAST + 1
++    static constexpr int kGamepadAxisCount = 6;    // GLFW_GAMEPAD_AXIS_LAST + 1
++
++    std::mutex m_snapshotMutex;
++    bool m_hasGamepad = false;
++    uint8_t m_buttons[kGamepadButtonCount] = {};
++    float m_axes[kGamepadAxisCount] = {};
+ };
+ 
+ #endif
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 index c5e31c4..e5abea3 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
@@ -1005,6 +1050,25 @@ index b50a4cf..53a8f59 100644
              fillPadStatus(outData, state, portState);
  
              {
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..074f401 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1899,8 +1899,13 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
+             return false;
+ 
+-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
++        if (!usedPreferred && countNonBlackPixels(pixels, width, height) == 0u)
+         {
++            // The display buffer may be the freshly cleared one of a double-buffer flip
++            // (the game flips twice per vsync and does not draw into every buffer each
++            // pass). If DISPFB points at an all-black buffer while one of the draw
++            // contexts holds a finished frame, present that frame instead — the PS2
++            // would be displaying the buffer the game just finished drawing.
+             for (const GSFrameReg &candidate : request.contextFrames)
+             {
+                 if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 index 5658928..a82c64c 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
@@ -1182,40 +1246,112 @@ index 37b6a4d..49293b0 100644
          switch (address)
          {
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..508eea6 100644
+index 8590f14..a8cc813 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,14 @@
 +#include <cstdio>
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
  #include <cstring>
-@@ -38,8 +39,22 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
++#include <mutex>
++
++// raylib ships GLFW (bundled under src/external/glfw); its joystick/gamepad API scans all
++// 16 slots and only reports devices with an SDL gamepad mapping, unlike raylib's
++// IsGamepadAvailable() which stops at 4 slots and accepts any HID input device.
++#define GLFW_INCLUDE_NONE
++#include <GLFW/glfw3.h>
+ 
+ namespace
+ {
+@@ -38,56 +46,71 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
  
      uint16_t btns = 0xFFFFu;
 -    constexpr int kGamepad = 0;
 -    const bool useGamepad = IsGamepadAvailable(kGamepad);
-+    // Use the first connected gamepad (slot 0 may hold a non-controller device on Linux), and
-+    // always read the keyboard too: a connected gamepad must not disable keyboard input.
-+    int kGamepad = -1;
-+    for (int i = 0; i < 4 && kGamepad < 0; ++i)
-+        if (IsGamepadAvailable(i))
-+            kGamepad = i;
-+    const bool useGamepad = kGamepad >= 0;
-+    static bool s_loggedDevices = false;
-+    if (!s_loggedDevices)
++    // Use the first joystick that carries a real SDL gamepad mapping (polled on the main
++    // thread by pollMain()), and always read the keyboard too: a connected gamepad must
++    // not disable keyboard input.
++    uint8_t padButtons[kGamepadButtonCount] = {};
++    float padAxes[kGamepadAxisCount] = {};
++    bool useGamepad = false;
 +    {
-+        s_loggedDevices = true;
-+        for (int i = 0; i < 4; ++i)
-+            if (IsGamepadAvailable(i))
-+                std::fprintf(stderr, "[pad] gamepad %d: %s%s\n", i, GetGamepadName(i), i == kGamepad ? " (used)" : "");
-+        std::fprintf(stderr, "[pad] keyboard input enabled\n");
++        std::lock_guard<std::mutex> lock(m_snapshotMutex);
++        useGamepad = m_hasGamepad;
++        if (useGamepad)
++        {
++            std::memcpy(padButtons, m_buttons, sizeof(padButtons));
++            std::memcpy(padAxes, m_axes, sizeof(padAxes));
++        }
 +    }
      auto clearBit = [&btns](uint16_t mask)
      { btns &= ~mask; };
++    auto isDown = [&padButtons, &useGamepad](int button) -> bool
++    { return useGamepad && padButtons[button] == GLFW_PRESS; };
  
-@@ -87,7 +102,6 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     if (useGamepad)
+     {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
++        if (isDown(GLFW_GAMEPAD_BUTTON_DPAD_UP))
+             clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
++        if (isDown(GLFW_GAMEPAD_BUTTON_DPAD_DOWN))
+             clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_DPAD_LEFT))
+             clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_DPAD_RIGHT))
+             clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
++        if (isDown(GLFW_GAMEPAD_BUTTON_A))
+             clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_B))
+             clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_X))
+             clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
++        if (isDown(GLFW_GAMEPAD_BUTTON_Y))
+             clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
++        if (isDown(GLFW_GAMEPAD_BUTTON_LEFT_BUMPER))
+             clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
++        if (isDown(GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER))
+             clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
++        // GLFW 3.3 has no digital trigger buttons; derive them from the trigger axes.
++        if (padAxes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] > 0.5f)
+             clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
++        if (padAxes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] > 0.5f)
+             clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_START))
+             clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
++        if (isDown(GLFW_GAMEPAD_BUTTON_BACK))
+             clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
++        if (isDown(GLFW_GAMEPAD_BUTTON_LEFT_THUMB))
+             clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
++        if (isDown(GLFW_GAMEPAD_BUTTON_RIGHT_THUMB))
+             clearBit(PAD_R3);
+ 
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
++        const float lx = padAxes[GLFW_GAMEPAD_AXIS_LEFT_X];
++        const float ly = padAxes[GLFW_GAMEPAD_AXIS_LEFT_Y];
++        const float rx = padAxes[GLFW_GAMEPAD_AXIS_RIGHT_X];
++        const float ry = padAxes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
+         data[6] = static_cast<uint8_t>(128 + lx * 127);
+         data[7] = static_cast<uint8_t>(128 + ly * 127);
          data[4] = static_cast<uint8_t>(128 + rx * 127);
          data[5] = static_cast<uint8_t>(128 + ry * 127);
      }
@@ -1223,8 +1359,53 @@ index 8590f14..508eea6 100644
      {
          if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
              clearBit(PAD_UP);
+@@ -123,3 +146,44 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
+ }
++
++void PSPadBackend::pollMain()
++{
++    // Main/render thread only: GLFW joystick functions are not thread-safe.
++    static bool s_loggedJoysticks = false;
++    int gamepad = -1;
++    for (int jid = 0; jid <= GLFW_JOYSTICK_LAST; ++jid)
++    {
++        if (glfwJoystickPresent(jid) != GLFW_TRUE)
++            continue;
++        const bool mapped = glfwJoystickIsGamepad(jid) == GLFW_TRUE;
++        if (!s_loggedJoysticks)
++        {
++            const char *name = glfwGetJoystickName(jid);
++            std::fprintf(stderr, "[pad] joystick %d: %s (%s)%s\n", jid, name ? name : "?",
++                         mapped ? "mapped gamepad" : "not a mapped gamepad",
++                         mapped && gamepad < 0 ? " [candidate]" : "");
++        }
++        if (mapped && gamepad < 0)
++            gamepad = jid;
++    }
++    if (!s_loggedJoysticks)
++    {
++        if (gamepad >= 0)
++            std::fprintf(stderr, "[pad] using joystick %d as gamepad\n", gamepad);
++        else
++            std::fprintf(stderr, "[pad] no mapped gamepad found\n");
++        std::fprintf(stderr, "[pad] keyboard input enabled\n");
++        s_loggedJoysticks = true;
++    }
++
++    GLFWgamepadstate state{};
++    const bool ok = gamepad >= 0 && glfwGetGamepadState(gamepad, &state) == GLFW_TRUE;
++    std::lock_guard<std::mutex> lock(m_snapshotMutex);
++    m_hasGamepad = ok;
++    if (ok)
++    {
++        std::memcpy(m_buttons, state.buttons, sizeof(m_buttons));
++        std::memcpy(m_axes, state.axes, sizeof(m_axes));
++    }
++}
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..8d1fe85 100644
+index 45cb9d2..d425212 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -25,6 +25,8 @@
@@ -1418,7 +1599,15 @@ index 45cb9d2..8d1fe85 100644
      std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
                << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
                << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
-@@ -2446,6 +2583,80 @@ void PS2Runtime::run()
+@@ -2422,6 +2559,7 @@ void PS2Runtime::run()
+         });
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
++        m_padBackend.pollMain(); // main thread: GLFW joystick sampling for the GameThread
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
+         BeginDrawing();
+@@ -2446,6 +2584,80 @@ void PS2Runtime::run()
          }
          EndDrawing();
  

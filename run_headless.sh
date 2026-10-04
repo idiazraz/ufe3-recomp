@@ -13,7 +13,7 @@ echo \$? > "$done_marker"
 INNER
 chmod +x "$inner"
 unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
-setsid dbus-run-session -- kwin_wayland --virtual --no-lockscreen --socket ufe3-headless \
+setsid dbus-run-session -- kwin_wayland --virtual --no-lockscreen --socket "ufe3-headless-$$" \
     --xwayland --width 1280 --height 720 --exit-with-session "$inner" \
     2> >(grep -vE '^(kwin_|kf\.|qt\.|org\.kde|QDBus|libinput|xkbcommon)' >&2) &
 pgid=$!
