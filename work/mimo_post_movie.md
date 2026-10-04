@@ -336,3 +336,36 @@ with PS2X_SOUNDMAN_PEEK + PS2X_EE_PEEK=0x4bd868,0x4bd86c,0x4bd870,0xbfccc0):**
   process-group kill missed it: PIDs of `dbus-run-session -- kwin_wayland --socket
   ufe3-headless`); it was terminated and the stale `/run/user/1000/ufe3-headless*`
   lock/socket removed before the final run. No background processes remain.
+
+## Finding 17 (addendum — second concurrent instance's runs, `run_post2/post3`)
+
+Independent runs of the same override build corroborate Finding 15 and add detail:
+
+- `work/run_post2.log` + `work/shots_mimo_post2/` (90 s headless, PS2X_IDLE_DUMP=2000,
+  PS2X_EE_PEEK=0x4bd860,0x4c0550, PS2X_SOUNDMAN_PEEK=1): queue timeline 0 → 7 → 8 →
+  **0x14/0x14 (20/20 drained)** and stable; zero `[ufe3] stream load` errors; entries
+  0/1 (lsn 0x761/0x760) complete with cmd id 1. Post-fix per-window histograms show the
+  load-wait loop is gone; the game advances into the FMV/logo scene flow
+  (movie player `sub_0032B980`/`sub_0032BCA8` via wrapper `sub_0021AC30`, `CLogo::process`
+  at 0x2952c0 seen as thread PC). The captured frames are still fully black — now because
+  the code on screen is FMV/logo scenes and the runtime has no IPU/VU1 rendering
+  (README known gaps), not because of the load manager.
+- `work/run_post3.log` (45 s) died early on a Wayland "Broken pipe" (kwin session teardown
+  flakiness) after ~5 s emulated; its snapshots (queue=7, movie FSM `sub_002C17D8` hot) are
+  consistent with run_post2's early phase.
+
+**Cautionary note — a bug found and fixed in the first draft of the override.** The first
+version wrote *every* load destination into EE RDRAM. That fed EE-dest loads fine but broke
+the sound-request path: cmd 0x1B jobs usually carry **IOP** destinations — SOUNDMAN cmd 1
+allocates the buffer (e.g. 0x1782C0 < 2 MiB) and cmd 3 plays from it — so the game's sound
+task (`sub_0035A590`/`sub_0035A120`) spun at ~150 k RPC/s retrying playback with a zeroed
+IOP buffer (evidenced by the first run's histogram and thread PC stuck in the SIF RPC path
+at 0x356EB8). The fix: route each range by address — IOP-range destinations go through
+`runtime.writeIopMemory`, EE destinations into `rdram`. This nuance also qualifies §6's
+"second gap": type-6 `memcpy` to IOP destinations is *correct* behavior; only the
+(unusual) type-6 jobs with EE destinations would need the runtime-side translation
+suggested in Finding 15, item 2.
+
+Post-fix state, in one line: the load/stream manager unblocks and delivers data to both
+address spaces; the remaining black screen is the known missing-IPU/VU1 rendering while
+the game drives FMV/logo scenes.

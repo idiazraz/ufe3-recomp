@@ -35,6 +35,70 @@ index cf4fdc6..d3133a1 100644
                  pending[pendingCount++] = {source, destination, size};
                  largestTransfer = std::max(largestTransfer, size);
              }
+diff --git a/ps2xRecomp/include/ps2recomp/code_generator.h b/ps2xRecomp/include/ps2recomp/code_generator.h
+index 1bdf0f6..8fe116b 100644
+--- a/ps2xRecomp/include/ps2recomp/code_generator.h
++++ b/ps2xRecomp/include/ps2recomp/code_generator.h
+@@ -55,6 +55,10 @@ namespace ps2recomp
+         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
+         void setEmitInstructionComments(bool emitInstructionComments);
+         void setReporter(RecompilerReporter *reporter);
++        // ERX/liberx import stub slots (`break 0x0,0x1 ; addiu $zero,$zero,N`) compile
++        // to runtime->callErxImport() instead of the plain break trap.
++        void setErxImportStubSlots(const std::unordered_set<uint32_t> &slots);
++        bool isErxImportStubSlot(uint32_t address) const;
+ 
+         AnalysisResult collectInternalBranchTargets(const Function &function,
+                                                   const std::vector<Instruction> &instructions,
+@@ -66,6 +70,7 @@ namespace ps2recomp
+         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
+         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
+         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
++        std::unordered_set<uint32_t> m_erxImportStubSlots;
+         const std::vector<Section>& m_sections;
+         BootstrapInfo m_bootstrapInfo;
+         bool m_emitInstructionComments = true;
+diff --git a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+index dd62275..5d90801 100644
+--- a/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
++++ b/ps2xRecomp/include/ps2recomp/ps2_recompiler.h
+@@ -72,6 +72,7 @@ namespace ps2recomp
+         std::unordered_map<uint32_t, std::string> m_stubHandlerBindingsByStart;
+         std::unordered_set<uint32_t> m_entryPointHintStarts;
+         std::unordered_set<uint32_t> m_correctnessCriticalFunctionStarts;
++        std::unordered_set<uint32_t> m_erxImportStubSlots;
+         std::map<uint32_t, std::string> m_generatedStubs;
+         std::unordered_map<uint32_t, std::string> m_functionRenames;
+         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
+@@ -84,6 +85,7 @@ namespace ps2recomp
+         bool isCorrectnessCriticalFunction(const Function &function) const;
+         bool hasResolvedStubHandler(const Function &function) const;
+         void collectCorrectnessCriticalFunctionStarts();
++        void collectErxImportStubSlots();
+         bool generateFunctionHeader();
+         bool generateStubHeader();
+         bool writeToFile(const std::string &path, const std::string &content);
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+index 68b0984..434b4c1 100644
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -156,6 +156,16 @@ namespace ps2recomp
+         m_emitInstructionComments = emitInstructionComments;
+     }
+ 
++    void CodeGenerator::setErxImportStubSlots(const std::unordered_set<uint32_t> &slots)
++    {
++        m_erxImportStubSlots = slots;
++    }
++
++    bool CodeGenerator::isErxImportStubSlot(uint32_t address) const
++    {
++        return m_erxImportStubSlots.find(address) != m_erxImportStubSlots.end();
++    }
++
+     void CodeGenerator::setReporter(RecompilerReporter *reporter)
+     {
+         m_reporter = reporter;
 diff --git a/ps2xRecomp/src/lib/control_flow_analyzer.cpp b/ps2xRecomp/src/lib/control_flow_analyzer.cpp
 index ed7578d..3e19828 100644
 --- a/ps2xRecomp/src/lib/control_flow_analyzer.cpp
@@ -95,8 +159,196 @@ index ed7578d..3e19828 100644
                                  }
                              }
  
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index bb35a7a..78a8fa1 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -12,6 +12,7 @@
+ #include <filesystem>
+ #include <cctype>
+ #include <condition_variable>
++#include <cstdio>
+ #include <cstring>
+ #include <exception>
+ #include <mutex>
+@@ -918,6 +919,7 @@ namespace ps2recomp
+             m_symbols = m_elfParser->extractSymbols();
+             m_sections = m_elfParser->getSections();
+             m_relocations = m_elfParser->getRelocations();
++            collectErxImportStubSlots();
+             collectCorrectnessCriticalFunctionStarts();
+ 
+             if (m_functions.empty())
+@@ -1023,6 +1025,7 @@ namespace ps2recomp
+             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+             m_codeGenerator->setEmitInstructionComments(true);
++            m_codeGenerator->setErxImportStubSlots(m_erxImportStubSlots);
+ 
+             fs::create_directories(m_config.outputPath);
+ 
+@@ -2235,6 +2238,142 @@ namespace ps2recomp
+         return resolveStubTarget(handlerName) != StubTarget::Unknown;
+     }
+ 
++    void PS2Recompiler::collectErxImportStubSlots()
++    {
++        m_erxImportStubSlots.clear();
++
++        // ERX/liberx import stub slot pattern (generic, no .erx.stub parsing needed):
++        //     break 0x0,0x1            (raw word 0x0000004D)
++        //     addiu $zero,$zero,N      (raw word 0x24000000 | N)
++        // N is the import's index in the named library's export table. Dispatch is
++        // keyed by the slot address: generated code calls
++        // runtime->callErxImport(rdram, ctx, slotAddress), which consults the
++        // binding table filled through PS2Runtime::bindErxImport().
++        constexpr uint32_t kBreakZeroOneWord = 0x0000004Du;
++        constexpr uint32_t kAddiuZeroZeroMask = 0xFFFF0000u;
++        constexpr uint32_t kAddiuZeroZeroWord = 0x24000000u;
++
++        for (const Section &section : m_sections)
++        {
++            if (!section.isCode || section.data == nullptr || section.size < 2u * sizeof(uint32_t))
++            {
++                continue;
++            }
++
++            for (uint32_t offset = 0; offset + 2u * sizeof(uint32_t) <= section.size; offset += sizeof(uint32_t))
++            {
++                uint32_t first = 0u;
++                uint32_t second = 0u;
++                std::memcpy(&first, section.data + offset, sizeof(first));
++                std::memcpy(&second, section.data + offset + sizeof(uint32_t), sizeof(second));
++                if (first == kBreakZeroOneWord && (second & kAddiuZeroZeroMask) == kAddiuZeroZeroWord)
++                {
++                    m_erxImportStubSlots.insert(section.address + offset);
++                }
++            }
++        }
++
++        if (m_erxImportStubSlots.empty())
++        {
++            return;
++        }
++
++        // On hardware every slot is an independent callable entry (callers JAL
++        // straight into it and the slot tail-dispatches to the bound export), so
++        // make sure no slot ends up hidden inside another function's body: slots
++        // outside every discovered function become their own 8-byte function, and
++        // functions containing slots are split at the slot starts.
++        for (uint32_t slot : m_erxImportStubSlots)
++        {
++            bool covered = false;
++            for (const Function &function : m_functions)
++            {
++                if (slot >= function.start && slot < function.end)
++                {
++                    covered = true;
++                    break;
++                }
++            }
++
++            if (!covered)
++            {
++                Function stubFunction;
++                char buffer[32]{};
++                std::snprintf(buffer, sizeof(buffer), "sub_%08X", slot);
++                stubFunction.name = buffer;
++                stubFunction.start = slot;
++                stubFunction.end = slot + 8u;
++                stubFunction.isRecompiled = false;
++                stubFunction.isStub = false;
++                stubFunction.isSkipped = false;
++                m_functions.push_back(stubFunction);
++            }
++        }
++
++        std::vector<Function> resliced;
++        resliced.reserve(m_functions.size() + m_erxImportStubSlots.size());
++        for (const Function &function : m_functions)
++        {
++            std::vector<uint32_t> splitPoints;
++            for (uint32_t slot : m_erxImportStubSlots)
++            {
++                if (slot > function.start && slot < function.end)
++                {
++                    splitPoints.push_back(slot);
++                }
++            }
++
++            if (splitPoints.empty())
++            {
++                resliced.push_back(function);
++                continue;
++            }
++
++            std::sort(splitPoints.begin(), splitPoints.end());
++            splitPoints.erase(std::unique(splitPoints.begin(), splitPoints.end()), splitPoints.end());
++
++            uint32_t pieceStart = function.start;
++            for (uint32_t splitPoint : splitPoints)
++            {
++                Function piece = function;
++                piece.start = pieceStart;
++                piece.end = splitPoint;
++                if (pieceStart != function.start)
++                {
++                    char buffer[32]{};
++                    std::snprintf(buffer, sizeof(buffer), "sub_%08X", pieceStart);
++                    piece.name = buffer;
++                    piece.isStub = false;
++                    piece.isSkipped = false;
++                }
++                resliced.push_back(piece);
++                pieceStart = splitPoint;
++            }
++
++            Function tail = function;
++            tail.start = pieceStart;
++            tail.end = function.end;
++            if (pieceStart != function.start)
++            {
++                char buffer[32]{};
++                std::snprintf(buffer, sizeof(buffer), "sub_%08X", pieceStart);
++                tail.name = buffer;
++                tail.isStub = false;
++                tail.isSkipped = false;
++            }
++            resliced.push_back(tail);
++        }
++
++        std::sort(resliced.begin(), resliced.end(),
++                  [](const Function &a, const Function &b)
++                  { return a.start < b.start; });
++        m_functions = std::move(resliced);
++
++        std::ostringstream msg;
++        msg << "found " << std::dec << m_erxImportStubSlots.size() << " ERX import stub slots";
++        m_reporter.progress(msg.str());
++    }
++
+     void PS2Recompiler::collectCorrectnessCriticalFunctionStarts()
+     {
+         m_correctnessCriticalFunctionStarts.clear();
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..6e0da23 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -45,6 +45,12 @@ namespace ps2recomp
+                                inst.address + 4u,
+                                (inst.raw >> 6) & 0xFFFFFu);
+         case SPECIAL_BREAK:
++            if (m_codeGenerator.isErxImportStubSlot(inst.address))
++            {
++                // ERX/liberx import stub slot: `break 0x0,0x1 ; addiu $zero,$zero,N`.
++                // The slot is a tail-call trampoline into the bound module export.
++                return fmt::format("runtime->callErxImport(rdram, ctx, 0x{:X}u); return;", inst.address);
++            }
+             return fmt::format("runtime->handleBreak(rdram, ctx);");
+         case SPECIAL_SYNC:
+             return "// SYNC instruction - memory barrier\n// In recompiled code, we don't need explicit memory barriers";
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..bcc563e 100644
+index 589d768..1b7cd8a 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -402,6 +402,14 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -114,6 +366,25 @@ index 589d768..bcc563e 100644
  if(PS2X_ENABLE_AGRESSIVE_LOGS)
      target_compile_definitions(ps2_runtime PUBLIC
          AGRESSIVE_LOGS=1
+@@ -469,6 +477,18 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     )
+ endif()
+ 
++# Generated ERX module code (see erx/step2 in the game project): compiled into the
++# runner when present. The directory holds sub_*.cpp/entry_*.cpp module functions,
++# erx_recompiled_functions.h and erx_register.cpp (overflow-registry registration).
++set(PS2X_ERX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/erx" CACHE PATH
++    "Directory with generated ERX module recompiled sources (empty/missing = disabled)")
++if(EXISTS "${PS2X_ERX_SOURCE_DIR}/erx_register.cpp")
++    file(GLOB PS2X_ERX_SRC_FILES CONFIGURE_DEPENDS "${PS2X_ERX_SOURCE_DIR}/*.cpp")
++    target_sources(ps2EntryRunner PRIVATE ${PS2X_ERX_SRC_FILES})
++    list(LENGTH PS2X_ERX_SRC_FILES PS2X_ERX_SRC_COUNT)
++    message(STATUS "Including ${PS2X_ERX_SRC_COUNT} generated ERX module sources from ${PS2X_ERX_SOURCE_DIR}")
++endif()
++
+ if(PS2X_ENABLE_RUNNER_PCH)
+     set(PS2X_RUNNER_PCH_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
 diff --git a/ps2xRuntime/include/ps2_debug_panel.h b/ps2xRuntime/include/ps2_debug_panel.h
 index b9933d5..839fafc 100644
 --- a/ps2xRuntime/include/ps2_debug_panel.h
@@ -191,10 +462,44 @@ index a42b1ba..b6e0c13 100644
  
  #endif
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..959317d 100644
+index 4b9242c..94035af 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
-@@ -345,6 +345,8 @@ public:
+@@ -338,6 +338,33 @@ public:
+     bool registerFunction(uint32_t address, RecompiledFunction func);
+     RecompiledFunction lookupFunction(uint32_t address);
+     bool hasFunction(uint32_t address) const;
++
++    // ---- Overflow function registry -------------------------------------
++    // Guest PCs outside the generated dense table [g_ps2RecompiledFunctionTableBase,
++    // g_ps2RecompiledFunctionTableEnd) -- e.g. recompiled ERX/module code linked at
++    // fixed addresses beyond the main ELF -- live in a sparse registry that is
++    // consulted by hasFunction/lookupFunction/registerFunction after the dense
++    // table (whose fast path is unchanged). The registry is process-global, like
++    // the dense table itself. Registration is expected at startup; reads are
++    // lock-free once registration completed.
++    static bool registerOverflowFunction(uint32_t address, RecompiledFunction func);
++    static RecompiledFunction lookupOverflowFunction(uint32_t address);
++    static bool hasOverflowFunction(uint32_t address);
++    static void clearOverflowFunctions();
++
++    // ---- ERX import stubs -----------------------------------------------
++    // The main ELF contains 8-byte import stub slots
++    //     break 0x0,0x1 ; addiu $zero,$zero,N
++    // (liberx binds them at module start). Generated code for such a slot calls
++    // callErxImport(); bindErxImport() connects the slot to the guest address of
++    // the module export it resolves to. Unbound slots log once and take the
++    // original unlinked-call trap (handleBreak).
++    static void bindErxImport(uint32_t slotAddress, uint32_t targetAddress);
++    static void unbindErxImport(uint32_t slotAddress);
++    static bool isErxImportBound(uint32_t slotAddress);
++    static void clearErxImportBindings();
++    // Returns true when the slot was bound and its target dispatched.
++    bool callErxImport(uint8_t *rdram, R5900Context *ctx, uint32_t slotAddress);
+     bool dispatchGuestBranch(uint8_t *rdram,
+                              R5900Context *ctx,
+                              uint32_t targetPc,
+@@ -345,6 +372,8 @@ public:
                               uint32_t fallthroughPc,
                               GuestBranchKind kind,
                               const char *debugName);
@@ -548,6 +853,100 @@ index 564d873..d59907c 100644
              setReturnS32(ctx, -1);
              return;
          }
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf..53a8f59 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,10 @@
++#include <vector>
++#include <string>
++#include <cstdlib>
++#include <cstdio>
+ #include "Common.h"
+ #include "Pad.h"
++#include "runtime/ee_scheduler.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -192,6 +197,63 @@ namespace ps2_stubs
+             }
+         }
+ 
++
++        // PS2X_PAD_SCRIPT="start@1500-1530,cross@2000-2010,...": hold buttons during vsync tick ranges (headless testing).
++        struct PadScriptEntry
++        {
++            uint16_t mask;
++            uint64_t first;
++            uint64_t last;
++        };
++
++        const std::vector<PadScriptEntry> &padScript()
++        {
++            static const std::vector<PadScriptEntry> entries = []()
++            {
++                std::vector<PadScriptEntry> parsed;
++                const char *env = std::getenv("PS2X_PAD_SCRIPT");
++                if (!env)
++                    return parsed;
++                static const std::pair<const char *, uint16_t> names[] = {
++                    {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
++                    {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
++                    {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
++                    {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross}, {"square", kPadBtnSquare}};
++                std::string spec(env);
++                size_t pos = 0;
++                while (pos < spec.size())
++                {
++                    const size_t comma = spec.find(',', pos);
++                    const std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++                    pos = (comma == std::string::npos) ? spec.size() : comma + 1;
++                    const size_t at = item.find('@');
++                    const size_t dash = item.find('-', at == std::string::npos ? 0 : at);
++                    if (at == std::string::npos)
++                        continue;
++                    const std::string name = item.substr(0, at);
++                    const uint64_t first = std::strtoull(item.c_str() + at + 1, nullptr, 10);
++                    const uint64_t last = (dash != std::string::npos) ? std::strtoull(item.c_str() + dash + 1, nullptr, 10) : first;
++                    for (const auto &[label, mask] : names)
++                        if (name == label)
++                            parsed.push_back({mask, first, last});
++                }
++                std::fprintf(stderr, "[pad-script] %zu entries\n", parsed.size());
++                return parsed;
++            }();
++            return entries;
++        }
++
++        void applyPadScript(PadInputState &state, PS2Runtime *runtime)
++        {
++            const auto &entries = padScript();
++            if (entries.empty() || !runtime)
++                return;
++            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
++            for (const PadScriptEntry &e : entries)
++                if (tick >= e.first && tick <= e.last)
++                    setButton(state, e.mask, true);
++        }
++
+         void resetPadStateLocked()
+         {
+             for (PadPortState &portState : g_padPorts)
+@@ -315,6 +377,14 @@ namespace ps2_stubs
+                 }
+             }
+ 
++            applyPadScript(state, runtime);
++            if (std::getenv("PS2X_TRACE_PAD"))
++            {
++                static uint32_t s_reads = 0u;
++                if ((s_reads++ % 300u) == 0u)
++                    std::fprintf(stderr, "[trace:pad] read #%u port=%d slot=%d buttons=%04x tick=%llu\n", s_reads, port, slot,
++                                 state.buttons, runtime ? static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()) : 0ull);
++            }
+             fillPadStatus(outData, state, portState);
+ 
+             {
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 index 5658928..a82c64c 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
@@ -586,10 +985,177 @@ index 37b6a4d..d1c3a5e 100644
  
                      auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..e7dc0af 100644
+index 45cb9d2..8d1fe85 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1134,6 +1134,11 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -25,6 +25,8 @@
+ #include <atomic>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
++#include <shared_mutex>
+ #include <sstream>
+ 
+ namespace ps2_stubs
+@@ -1086,6 +1088,128 @@ namespace
+         slot = offset >> 2;
+         return slot < g_ps2RecompiledFunctionTableSlotCount;
+     }
++
++    // Sparse registry for recompiled functions outside the generated dense table
++    // (e.g. ERX/module code linked at fixed addresses beyond the main ELF).
++    // Registration is expected at startup; the shared mutex only guards concurrent
++    // mutation/lookup and is never taken on the dense-table fast path.
++    std::shared_mutex g_overflowFunctionsMutex;
++    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_overflowFunctions;
++
++    // ERX import stub bindings: slot address -> resolved target guest address.
++    std::mutex g_erxImportMutex;
++    std::unordered_map<uint32_t, uint32_t> g_erxImportTargets;
++    std::unordered_set<uint32_t> g_erxImportReportedUnbound;
++}
++
++bool PS2Runtime::registerOverflowFunction(uint32_t address, RecompiledFunction func)
++{
++    if ((address & 3u) != 0u)
++    {
++        std::cerr << "[function-table] cannot register unaligned guest PC 0x" << std::hex << address
++                  << std::dec << std::endl;
++        return false;
++    }
++
++    std::unique_lock<std::shared_mutex> lock(g_overflowFunctionsMutex);
++    if (func == nullptr)
++    {
++        g_overflowFunctions.erase(address);
++        return true;
++    }
++
++    g_overflowFunctions[address] = func;
++    return true;
++}
++
++PS2Runtime::RecompiledFunction PS2Runtime::lookupOverflowFunction(uint32_t address)
++{
++    std::shared_lock<std::shared_mutex> lock(g_overflowFunctionsMutex);
++    const auto it = g_overflowFunctions.find(address);
++    return it != g_overflowFunctions.end() ? it->second : nullptr;
++}
++
++bool PS2Runtime::hasOverflowFunction(uint32_t address)
++{
++    return lookupOverflowFunction(address) != nullptr;
++}
++
++void PS2Runtime::clearOverflowFunctions()
++{
++    std::unique_lock<std::shared_mutex> lock(g_overflowFunctionsMutex);
++    g_overflowFunctions.clear();
++}
++
++void PS2Runtime::bindErxImport(uint32_t slotAddress, uint32_t targetAddress)
++{
++    std::lock_guard<std::mutex> lock(g_erxImportMutex);
++    g_erxImportTargets[slotAddress & ~3u] = targetAddress;
++}
++
++void PS2Runtime::unbindErxImport(uint32_t slotAddress)
++{
++    std::lock_guard<std::mutex> lock(g_erxImportMutex);
++    g_erxImportTargets.erase(slotAddress & ~3u);
++}
++
++bool PS2Runtime::isErxImportBound(uint32_t slotAddress)
++{
++    std::lock_guard<std::mutex> lock(g_erxImportMutex);
++    return g_erxImportTargets.find(slotAddress & ~3u) != g_erxImportTargets.end();
++}
++
++void PS2Runtime::clearErxImportBindings()
++{
++    std::lock_guard<std::mutex> lock(g_erxImportMutex);
++    g_erxImportTargets.clear();
++    g_erxImportReportedUnbound.clear();
++}
++
++bool PS2Runtime::callErxImport(uint8_t *rdram, R5900Context *ctx, uint32_t slotAddress)
++{
++    const uint32_t slot = slotAddress & ~3u;
++    uint32_t target = 0u;
++    bool firstUnboundReport = false;
++    {
++        std::lock_guard<std::mutex> lock(g_erxImportMutex);
++        const auto it = g_erxImportTargets.find(slot);
++        if (it != g_erxImportTargets.end())
++        {
++            target = it->second;
++        }
++        else
++        {
++            firstUnboundReport = g_erxImportReportedUnbound.insert(slot).second;
++        }
++    }
++
++    if (target == 0u)
++    {
++        if (firstUnboundReport)
++        {
++            std::cerr << "[erx-import] unbound import stub at PC 0x" << std::hex << slot
++                      << std::dec << ": taking the unlinked-call trap (missing bindErxImport)"
++                      << std::endl;
++        }
++
++        // The original slot is `break 0x0,0x1`; behave like the unlinked trap.
++        handleBreak(rdram, ctx);
++        return false;
++    }
++
++    ctx->pc = target;
++    RecompiledFunction fn = lookupFunction(target);
++    const uint32_t entryPc = ctx->pc;
++    fn(rdram, ctx, this);
++
++    // The stub slot is a tail-call trampoline: if the target came back without
++    // transferring the PC (e.g. a C++ handler stub), return to the guest $ra.
++    if (ctx->pc == entryPc)
++    {
++        ctx->pc = getRegU32(ctx, 31);
++    }
++
++    return true;
+ }
+ 
+ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+@@ -1093,11 +1217,9 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+     uint32_t slot = 0u;
+     if (!generatedFunctionTableSlot(address, slot))
+     {
+-        std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
+-                  << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
+-                  << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
+-                  << std::dec << std::endl;
+-        return false;
++        // Outside the generated dense table: keep it in the overflow registry so
++        // recompiled module code (ERX etc.) can be registered and dispatched.
++        return registerOverflowFunction(address, func);
+     }
+ 
+     g_ps2RecompiledFunctionTable[slot] = func;
+@@ -1112,7 +1234,12 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+     uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
++    {
++        return true;
++    }
++
++    return hasOverflowFunction(address);
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1134,6 +1261,11 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
      }
  }
  
@@ -601,7 +1167,19 @@ index 45cb9d2..e7dc0af 100644
  PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
  {
      pushDispatchPc(address);
-@@ -2446,6 +2451,80 @@ void PS2Runtime::run()
+@@ -1148,6 +1280,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+         }
+     }
+ 
++    if (RecompiledFunction fn = lookupOverflowFunction(address))
++    {
++        return fn;
++    }
++
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
+@@ -2446,6 +2583,80 @@ void PS2Runtime::run()
          }
          EndDrawing();
  
@@ -682,3 +1260,227 @@ index 45cb9d2..e7dc0af 100644
          if (WindowShouldClose())
          {
              RUNTIME_LOG("[run] window close requested, breaking out of loop");
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 5db04b9..af81a2c 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -37,6 +37,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_sif_dma_tests.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
++    src/ps2_erx_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 40a68b1..9f78182 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -18,6 +18,7 @@ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
++void register_ps2_erx_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -40,6 +41,7 @@ int main()
+     register_ps2_sif_dma_tests();
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
++    register_ps2_erx_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_erx_tests.cpp b/ps2xTest/src/ps2_erx_tests.cpp
+new file mode 100644
+index 0000000..e0eb523
+--- /dev/null
++++ b/ps2xTest/src/ps2_erx_tests.cpp
+@@ -0,0 +1,186 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++
++#include <cstdint>
++#include <sstream>
++#include <string>
++
++namespace
++{
++    uint32_t g_erxTargetCalls = 0u;
++    uint32_t g_erxTargetEntryPc = 0u;
++
++    void erxTargetHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)rdram;
++        (void)runtime;
++        ++g_erxTargetCalls;
++        g_erxTargetEntryPc = ctx->pc;
++        // jr $ra
++        ctx->pc = getRegU32(ctx, 31);
++    }
++
++    void erxSilentTargetHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)rdram;
++        (void)ctx;
++        (void)runtime;
++        ++g_erxTargetCalls;
++    }
++
++    size_t countOccurrences(const std::string &haystack, const std::string &needle)
++    {
++        size_t count = 0;
++        size_t pos = 0;
++        while ((pos = haystack.find(needle, pos)) != std::string::npos)
++        {
++            ++count;
++            pos += needle.size();
++        }
++        return count;
++    }
++}
++
++void register_ps2_erx_tests()
++{
++    MiniTest::Case("ERX overflow function registry", [](TestCase &tc)
++    {
++        tc.Run("overflow registration and lookup work outside the dense table", [](TestCase &t)
++        {
++            PS2Runtime::clearOverflowFunctions();
++
++            // Inside the test dense table range (its slots are empty here) the
++            // registry must still be consulted after the dense lookup misses.
++            const uint32_t kInsideTable = 0x01C00018u;
++            // Fully outside every dense table: the pure sparse path (real ERX
++            // module code sits at 0x01C00000+ in the game, above its dense table).
++            const uint32_t kOutsideTable = 0x10000000u;
++            const uint32_t kReplaceAddr = 0x10000010u;
++
++            PS2Runtime runtime;
++            t.IsFalse(runtime.hasFunction(kInsideTable), "registry must start empty");
++            t.IsFalse(runtime.hasFunction(kOutsideTable), "registry must start empty");
++
++            t.IsTrue(PS2Runtime::registerOverflowFunction(kInsideTable, &erxTargetHandler),
++                      "registerOverflowFunction should accept aligned addresses");
++            t.IsTrue(PS2Runtime::registerOverflowFunction(kOutsideTable, &erxTargetHandler),
++                      "registerOverflowFunction should accept aligned addresses");
++            // registerFunction/replaceFunction transparently fall back to the
++            // overflow registry for guest PCs outside the dense table.
++            t.IsTrue(runtime.registerFunction(kReplaceAddr, &erxSilentTargetHandler),
++                      "registerFunction should accept out-of-table addresses");
++
++            t.IsTrue(runtime.hasFunction(kInsideTable), "hasFunction must consult the overflow registry");
++            t.IsTrue(runtime.hasFunction(kOutsideTable), "hasFunction must consult the overflow registry");
++            t.IsTrue(runtime.hasFunction(kReplaceAddr), "registerFunction fallback must be discoverable");
++            t.IsTrue(PS2Runtime::hasOverflowFunction(kOutsideTable), "hasOverflowFunction should find the entry");
++
++            t.IsTrue(runtime.lookupFunction(kInsideTable) == &erxTargetHandler,
++                      "lookupFunction must resolve overflow entries inside the table range");
++            t.IsTrue(runtime.lookupFunction(kOutsideTable) == &erxTargetHandler,
++                      "lookupFunction must resolve overflow entries outside the table range");
++            t.IsTrue(PS2Runtime::lookupOverflowFunction(kReplaceAddr) == &erxSilentTargetHandler,
++                      "lookupOverflowFunction must resolve registered entries");
++            t.IsFalse(PS2Runtime::registerOverflowFunction(kOutsideTable + 1u, &erxTargetHandler),
++                       "unaligned registration must be rejected");
++
++            PS2Runtime::clearOverflowFunctions();
++            t.IsFalse(runtime.hasFunction(kOutsideTable), "clearOverflowFunctions must empty the registry");
++        });
++    });
++
++    MiniTest::Case("ERX import stub dispatch", [](TestCase &tc)
++    {
++        tc.Run("callErxImport dispatches bound slots to their target", [](TestCase &t)
++        {
++            PS2Runtime::clearOverflowFunctions();
++            PS2Runtime::clearErxImportBindings();
++
++            PS2Runtime runtime;
++            const uint32_t kSlot = 0x0035B408u;   // main-ELF stub slot shape
++            const uint32_t kTarget = 0x10000000u; // module export shape
++            const uint32_t kReturnPc = 0x00212348u;
++
++            g_erxTargetCalls = 0u;
++            g_erxTargetEntryPc = 0u;
++            PS2Runtime::registerOverflowFunction(kTarget, &erxTargetHandler);
++            PS2Runtime::bindErxImport(kSlot, kTarget);
++
++            t.IsTrue(PS2Runtime::isErxImportBound(kSlot), "bound slot must report bound");
++
++            R5900Context ctx{};
++            SET_GPR_U32(&ctx, 31, kReturnPc);
++            ctx.pc = kSlot;
++
++            std::stringstream log;
++            std::streambuf *oldBuf = std::cerr.rdbuf(log.rdbuf());
++            const bool dispatched = runtime.callErxImport(nullptr, &ctx, kSlot);
++            std::cerr.rdbuf(oldBuf);
++
++            t.IsTrue(dispatched, "bound slot must dispatch");
++            t.Equals(g_erxTargetCalls, 1u, "target must run exactly once");
++            t.Equals(g_erxTargetEntryPc, kTarget, "target must be entered at its guest address");
++            t.Equals(ctx.pc, kReturnPc, "target's jr $ra must return to the caller's link address");
++            t.Equals(countOccurrences(log.str(), "unbound"), size_t(0), "bound slot must not report");
++        });
++
++        tc.Run("callErxImport reports unbound slots once and traps", [](TestCase &t)
++        {
++            PS2Runtime::clearOverflowFunctions();
++            PS2Runtime::clearErxImportBindings();
++
++            PS2Runtime runtime;
++            const uint32_t kSlot = 0x0035B410u;
++
++            t.IsFalse(PS2Runtime::isErxImportBound(kSlot), "slot must start unbound");
++
++            std::stringstream log;
++            std::streambuf *oldBuf = std::cerr.rdbuf(log.rdbuf());
++            R5900Context ctx{};
++            SET_GPR_U32(&ctx, 31, 0x00212348u);
++            ctx.pc = kSlot;
++            const bool first = runtime.callErxImport(nullptr, &ctx, kSlot);
++            const bool second = runtime.callErxImport(nullptr, &ctx, kSlot);
++            std::cerr.rdbuf(oldBuf);
++
++            t.IsFalse(first, "unbound slot must not dispatch");
++            t.IsFalse(second, "unbound slot must not dispatch");
++            t.Equals(countOccurrences(log.str(), "unbound import stub"), size_t(1),
++                     "unbound slot must be reported exactly once");
++
++            // The unlinked stub is a `break 0x0,0x1` on hardware: the fallback
++            // must take the same break trap as the original instruction.
++            t.IsTrue((ctx.cop0_cause & 0x7Cu) == ((uint32_t)EXCEPTION_BREAKPOINT << 2),
++                     "unbound slot must raise the breakpoint exception");
++
++            PS2Runtime::bindErxImport(kSlot, 0x10000000u);
++            t.IsTrue(PS2Runtime::isErxImportBound(kSlot), "bindErxImport must register the slot");
++            PS2Runtime::unbindErxImport(kSlot);
++            t.IsFalse(PS2Runtime::isErxImportBound(kSlot), "unbindErxImport must remove the slot");
++        });
++
++        tc.Run("callErxImport returns to $ra when the target does not touch the PC", [](TestCase &t)
++        {
++            PS2Runtime::clearOverflowFunctions();
++            PS2Runtime::clearErxImportBindings();
++
++            PS2Runtime runtime;
++            const uint32_t kSlot = 0x0035B418u;
++            const uint32_t kTarget = 0x10000010u;
++            const uint32_t kReturnPc = 0x00212348u;
++
++            g_erxTargetCalls = 0u;
++            PS2Runtime::registerOverflowFunction(kTarget, &erxSilentTargetHandler);
++            PS2Runtime::bindErxImport(kSlot, kTarget);
++
++            R5900Context ctx{};
++            SET_GPR_U32(&ctx, 31, kReturnPc);
++            ctx.pc = kSlot;
++
++            t.IsTrue(runtime.callErxImport(nullptr, &ctx, kSlot), "bound slot must dispatch");
++            t.Equals(g_erxTargetCalls, 1u, "target must run exactly once");
++            t.Equals(ctx.pc, kReturnPc, "stub slot is a tail-call trampoline: fall back to the link address");
++        });
++    });
++}

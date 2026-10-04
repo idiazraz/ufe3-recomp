@@ -22,3 +22,7 @@ build/
 
 # Pre-linked ERX images are derived from game code (regenerate with erx/erx_prelink.py)
 /erx/out/*.bin
+/erx/step2/gen/
+/erx/step2/out/
+/erx/step2/wrap/
+/erx/step2/cfg/
