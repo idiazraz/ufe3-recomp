@@ -1,4 +1,5 @@
 # ufe3-recomp
+<img width="850" height="274" alt="6796f650a074ef60bd6d33a1b59054a0" src="https://github.com/user-attachments/assets/d5fd326c-700c-41d3-bcb2-88c7ee07a206" />
 
 A static recompilation of **Ultraman Fighting Evolution 3** (PlayStation 2, Banpresto/Metro, Japan 2004, `SLPS-25441`)
 to native Linux code, built on [PS2Recomp](https://github.com/ran-j/PS2Recomp).
