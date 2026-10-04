@@ -19,3 +19,6 @@
 build/
 *.log
 *.png
+
+# Pre-linked ERX images are derived from game code (regenerate with erx/erx_prelink.py)
+/erx/out/*.bin
