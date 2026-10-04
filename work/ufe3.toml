@@ -25,10 +25,9 @@ stubs = [
   # frame. sub_0032CAD8 is the movie player's end-of-movie query (pos == total-2); reporting
   # "finished" makes every FMV scene end the movie through its own normal path (same as
   # pressing Start / the movie ending). All other player/scene code is left intact.
-  "ret1@0x0032CAD8",
+  # (movie-ended stub removed: movies are skipped with a button press, as on hardware)
   # The opening scene also waits for its movie audio stream (SOUNDMAN cmd 0x24) to stop; with the
   # movie skipped that stream never ends. Only caller is the COpening movie wrapper (0x21BB34).
-  "ret0@0x00356B88",
   # Kernel import stub slots that are reached by a direct `j` tail call (the generated code
   # calls them as C++ functions, bypassing runtime.replaceFunction): bind at compile time.
   "ret0@0x003722A0",
