@@ -789,6 +789,64 @@ index b1bb6d8..029e65d 100644
          }
  
          mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
+index e851bd2..5adfdaf 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp
+@@ -1,9 +1,18 @@
+ #include "Common.h"
+ #include "IPU.h"
+ #include "runtime/ee_scheduler.h"
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace
+ {
++    // PS2X_TRACE_IPU=1: trace-only logging of libipu HLE calls. No behaviour change.
++    bool ipuTraceEnabled()
++    {
++        static const bool enabled = std::getenv("PS2X_TRACE_IPU") != nullptr;
++        return enabled;
++    }
++
+     constexpr uint32_t REG_IPU_CTRL = 0x10002010u;
+     constexpr uint32_t REG_IPU_CMD = 0x10002000u;
+     constexpr uint32_t REG_IPU_IN_FIFO = 0x10007010u;
+@@ -52,6 +61,8 @@ namespace ps2_stubs
+ {
+     void sceIpuInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (ipuTraceEnabled())
++            std::fprintf(stderr, "[trace:ipu] sceIpuInit\n");
+         if (!runtime)
+             return;
+ 
+@@ -93,16 +104,25 @@ namespace ps2_stubs
+ 
+     void sceIpuRestartDMA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (ipuTraceEnabled())
++            std::fprintf(stderr, "[trace:ipu] sceIpuRestartDMA\n");
+         setReturnS32(ctx, 0);
+     }
+ 
+     void sceIpuStopDMA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (ipuTraceEnabled())
++            std::fprintf(stderr, "[trace:ipu] sceIpuStopDMA\n");
+         setReturnS32(ctx, 0);
+     }
+ 
+     void sceIpuSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        static uint64_t s_syncCalls = 0;
++        if (ipuTraceEnabled() && (s_syncCalls < 50 || (s_syncCalls % 1000u) == 0))
++            std::fprintf(stderr, "[trace:ipu] sceIpuSync (call #%llu)\n",
++                         static_cast<unsigned long long>(s_syncCalls + 1));
++        ++s_syncCalls;
+         setReturnS32(ctx, 0);
+     }
+ }
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 index 564d873..d59907c 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
@@ -970,10 +1028,134 @@ index 5658928..a82c64c 100644
          if (m_backend)
          {
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..d1c3a5e 100644
+index 37b6a4d..49293b0 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -1344,7 +1344,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -3,6 +3,8 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -36,6 +38,67 @@ namespace
+         std::memcpy(base + offset, &value, sizeof(T));
+     }
+ 
++    // PS2X_TRACE_IPU=1: trace-only logging of IPU register writes and IPU DMA starts
++    // (ch3 fromIPU / ch4 toIPU). No behaviour change.
++    inline bool ipuTraceEnabled()
++    {
++        static const bool enabled = std::getenv("PS2X_TRACE_IPU") != nullptr;
++        return enabled;
++    }
++
++    void traceIpuCmd(uint32_t value)
++    {
++        static constexpr const char *kNames[16] = {
++            "BCLR", "IDEC", "BDEC", "VDEC", "FDEC", "SETIQ", "SETVQ", "CSC", "PACK", "SETTH",
++            "RSV_A", "RSV_B", "RSV_C", "RSV_D", "RSV_E", "RSV_F"};
++        const uint32_t cmd = (value >> 28) & 0xF;
++        char detail[128];
++        switch (cmd)
++        {
++        case 0: // BCLR: clears in-FIFO, BP = val[6:0]
++            std::snprintf(detail, sizeof(detail), "bp=%u", value & 0x7F);
++            break;
++        case 1: // IDEC
++            std::snprintf(detail, sizeof(detail), "fb=%u qsc=%u dtd=%u sgn=%u dte=%u ofm=%s",
++                          value & 0x3F, (value >> 16) & 0x1F, (value >> 24) & 1, (value >> 25) & 1,
++                          (value >> 26) & 1, ((value >> 27) & 1) ? "RGB16" : "RGB32");
++            break;
++        case 2: // BDEC
++            std::snprintf(detail, sizeof(detail), "fb=%u qsc=%u dt=%u dcr=%u mbi=%u",
++                          value & 0x3F, (value >> 16) & 0x1F, (value >> 25) & 1, (value >> 26) & 1,
++                          (value >> 27) & 1);
++            break;
++        case 3: // VDEC: table = val[27:26] (0=MBAI, 1=MBT, 2=MC, 3=DMV)
++            std::snprintf(detail, sizeof(detail), "table=%u fb=%u", (value >> 26) & 3, value & 0x3F);
++            break;
++        case 4: // FDEC: reads 32 bits to TOP
++            std::snprintf(detail, sizeof(detail), "fb=%u", value & 0x3F);
++            break;
++        case 5: // SETIQ: val[27] selects non-intra matrix, 64 bytes from in-FIFO
++            std::snprintf(detail, sizeof(detail), "%s fb=%u",
++                          ((value >> 27) & 1) ? "non-intra" : "intra", value & 0x3F);
++            break;
++        case 6: // SETVQ: 32 bytes (16-entry CLUT) from in-FIFO
++            detail[0] = '\0';
++            break;
++        case 7: // CSC: YCbCr -> RGB
++            std::snprintf(detail, sizeof(detail), "mbc=%u dte=%u ofm=%s", value & 0x7FF,
++                          (value >> 26) & 1, ((value >> 27) & 1) ? "RGB16" : "RGB32");
++            break;
++        case 8: // PACK: RGB32 -> RGB16/VQ4
++            std::snprintf(detail, sizeof(detail), "mbc=%u dte=%u ofm=%s", value & 0x7FF,
++                          (value >> 26) & 1, ((value >> 27) & 1) ? "RGB16" : "VQ4");
++            break;
++        case 9: // SETTH
++            std::snprintf(detail, sizeof(detail), "th0=%u th1=%u", value & 0x1FF, (value >> 16) & 0x1FF);
++            break;
++        default:
++            detail[0] = '\0';
++            break;
++        }
++        std::fprintf(stderr, "[trace:ipu] CMD=0x%08X %s %s\n", value, kNames[cmd], detail);
++    }
++
+     inline bool isGsPrivReg(uint32_t addr)
+     {
+         return Ps2AddressInRange(addr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE);
+@@ -1181,6 +1244,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+     if (address >= 0x10002000 && address <= 0x10002030)
+     {
++        if (ipuTraceEnabled())
++        {
++            if (address == 0x10002000)
++                traceIpuCmd(value);
++            else
++                std::fprintf(stderr, "[trace:ipu] %s=0x%08X\n",
++                             address == 0x10002010 ? "CTRL" : address == 0x10002020 ? "BP" : "TOP", value);
++        }
+         if (address == 0x10002010)
+         {
+             m_ioRegisters[address] = value & ~(1u << 31);
+@@ -1198,6 +1269,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
++    if (ipuTraceEnabled() && address >= 0x1000B000u && address <= 0x1000B430u)
++    {
++        const uint32_t ch = address & 0xFFFFFF00u;
++        const uint32_t off = address & 0xFFu;
++        if ((ch == 0x1000B000u || ch == 0x1000B400u) &&
++            (off == 0x00u || off == 0x10u || off == 0x20u || off == 0x30u))
++        {
++            std::fprintf(stderr, "[trace:ipu] WR DMA ch%d %s=0x%08X\n", ch == 0x1000B000u ? 3 : 4,
++                         off == 0x00u ? "chcr" : off == 0x10u ? "madr" : off == 0x20u ? "qwc" : "tadr", value);
++        }
++    }
++
+     if (address == 0x1000E010u)
+     {
+         const uint32_t current = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+@@ -1305,6 +1388,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++            if (ipuTraceEnabled() && (channelBase == 0x1000B000u || channelBase == 0x1000B400u))
++            {
++                std::fprintf(stderr, "[trace:ipu] DMA ch%d %s madr=0x%08X qwc=0x%X chcr=0x%08X\n",
++                             channelBase == 0x1000B000u ? 3 : 4,
++                             channelBase == 0x1000B000u ? "fromIPU" : "toIPU", madr, qwc, value);
++            }
+ 
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+@@ -1344,7 +1433,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                      uint32_t asp = (chcr >> 4) & 0x3u;
                      const bool tieEnabled = (chcr & (1u << 7)) != 0u;
@@ -984,6 +1166,63 @@ index 37b6a4d..d1c3a5e 100644
                      std::vector<uint8_t> chainBuf;
  
                      auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -2319,6 +2410,14 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+ 
+     if (address >= 0x10002000 && address <= 0x10002030)
+     {
++        if (ipuTraceEnabled())
++        {
++            // Rate-limited: busy-wait polls would otherwise flood the log.
++            static uint64_t s_ctrlReads = 0;
++            if (address == 0x10002010 && (s_ctrlReads++ < 50 || (s_ctrlReads % 100000u) == 0))
++                std::fprintf(stderr, "[trace:ipu] RD CTRL (read #%llu)\n",
++                             static_cast<unsigned long long>(s_ctrlReads));
++        }
+         uint32_t val = 0;
+         switch (address)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..508eea6 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ #include <cstring>
+@@ -38,8 +39,22 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+ 
+     uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
++    // Use the first connected gamepad (slot 0 may hold a non-controller device on Linux), and
++    // always read the keyboard too: a connected gamepad must not disable keyboard input.
++    int kGamepad = -1;
++    for (int i = 0; i < 4 && kGamepad < 0; ++i)
++        if (IsGamepadAvailable(i))
++            kGamepad = i;
++    const bool useGamepad = kGamepad >= 0;
++    static bool s_loggedDevices = false;
++    if (!s_loggedDevices)
++    {
++        s_loggedDevices = true;
++        for (int i = 0; i < 4; ++i)
++            if (IsGamepadAvailable(i))
++                std::fprintf(stderr, "[pad] gamepad %d: %s%s\n", i, GetGamepadName(i), i == kGamepad ? " (used)" : "");
++        std::fprintf(stderr, "[pad] keyboard input enabled\n");
++    }
+     auto clearBit = [&btns](uint16_t mask)
+     { btns &= ~mask; };
+ 
+@@ -87,7 +102,6 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         data[4] = static_cast<uint8_t>(128 + rx * 127);
+         data[5] = static_cast<uint8_t>(128 + ry * 127);
+     }
+-    else
+     {
+         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+             clearBit(PAD_UP);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
 index 45cb9d2..8d1fe85 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
