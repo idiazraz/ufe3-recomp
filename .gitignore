@@ -1,0 +1,21 @@
+# Game data: never commit. Users supply their own disc.
+/iso/
+/disc/
+*.iso
+*.bin
+*.BIN
+*.zip
+*.7z
+
+# PS2Recomp checkout (recreated by setup.sh from upstream + patches/)
+/tools/
+
+# Generated / derived from the game binary
+/work/*
+!/work/ufe3.toml
+!/work/*.md
+
+# Build and debug output
+build/
+*.log
+*.png

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Ultraman Fighting Evolution 3",
+  "system": "PS2",
+  "type": "recomp",
+  "toolchain": "PS2Recomp",
+  "status": "in-progress",
+  "original": { "region": "Japan", "serial": "SLPS-25441" }
+}
