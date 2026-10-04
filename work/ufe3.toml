@@ -29,6 +29,10 @@ stubs = [
   # The opening scene also waits for its movie audio stream (SOUNDMAN cmd 0x24) to stop; with the
   # movie skipped that stream never ends. Only caller is the COpening movie wrapper (0x21BB34).
   "ret0@0x00356B88",
+  # Kernel import stub slots that are reached by a direct `j` tail call (the generated code
+  # calls them as C++ functions, bypassing runtime.replaceFunction): bind at compile time.
+  "ret0@0x003722A0",
+  "ret0@0x00372348",
   "sceCdSearchFile@0x0035E9A8",
   "sceGsResetGraph@0x0035BA90",
   "sceGsResetPath@0x0035BC30",
