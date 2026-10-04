@@ -5,5 +5,7 @@
   "type": "recomp",
   "toolchain": "PS2Recomp",
   "status": "in-progress",
-  "original": { "region": "Japan", "serial": "SLPS-25441" }
+  "original": { "region": "Japan", "serial": "SLPS-25441" },
+  "targets": ["Linux"],
+  "maintainers": [{ "name": "idiazraz", "link": "https://github.com/idiazraz" }]
 }
