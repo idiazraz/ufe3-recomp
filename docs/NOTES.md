@@ -16,9 +16,10 @@
 2. Memory-card check screen ("チェック中です").
 3. Health-warning screen renders correctly.
 4. Opening movie: the game drives the IPU (MPEG decoder) directly. PS2Recomp has no IPU emulation, so movies are
-   skipped (`work/ufe3.toml`: `ret1@0x0032CAD8` movie-ended query, `ret0@0x00356B88` movie-audio-busy query).
-5. **Current blocker:** black screen after the movie. A load/stream slot in the game's stream manager reaches its
-   "waiting" phase without the request being sent to SOUNDMAN. Under investigation (`work/mimo_post_movie.md`).
+   skipped in the main build. The `ret1@0x0032CAD8`/`ret0@0x00356B88` toml stubs were removed for the IPU work.
+5. **Movies (2026-10-05):** a real IPU decoder (PCSX2 core port, worktree tools/PS2Recomp-ipu, branch ipu-work, not yet merged)
+   plays the opening FMV sharp to its end (~16 fps vs 30). **Current blocker:** the opening scene also waits for SOUNDMAN's movie-audio
+   stream (cmd 0x24) to finish. That stream never ends, likely because SPU2 is not really emulated. Details: `work/ipu_port.md` Step 7.
 
 ## PS2Recomp fixes (in `patches/ps2recomp.patch`)
 
