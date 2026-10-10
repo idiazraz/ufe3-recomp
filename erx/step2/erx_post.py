@@ -24,6 +24,8 @@ import sys
 
 DECL_RE = re.compile(r'^void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(uint8_t\s*\*\s*rdram,')
 ADDR_RE = re.compile(r'_0x([0-9a-fA-F]+)$')
+RA_SET_RE = re.compile(r'SET_GPR_U32\(ctx, 31, 0x([0-9A-Fa-f]+)u\)')
+RESUME_CASE_RE = re.compile(r'case 0x([0-9A-Fa-f]+)u: goto label_')
 
 
 def main():
@@ -37,6 +39,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     decls = {}  # name -> address
+    resume = {}  # return address -> containing function
     copied = 0
     modules = sorted(d for d in os.listdir(gen_dir) if os.path.isdir(os.path.join(gen_dir, d)))
     for mod in modules:
@@ -65,6 +68,15 @@ def main():
             with open(os.path.join(out_dir, fn), 'w') as f:
                 f.write(src)
             copied += 1
+            # Return sites the EE scheduler may resume at after a blocking call: every `jal`/`jalr`
+            # return address this function both sets in $ra and accepts in its `switch (ctx->pc)`.
+            for body in re.split(r'(?m)^void\s+', src)[1:]:
+                fname = body.split('(', 1)[0].strip()
+                cases = set(int(x, 16) for x in RESUME_CASE_RE.findall(body))
+                for x in RA_SET_RE.findall(body):
+                    ra = int(x, 16)
+                    if ra in cases:
+                        resume.setdefault(ra, fname)
 
     # Combined declarations header.
     with open(os.path.join(out_dir, 'erx_recompiled_functions.h'), 'w') as f:
@@ -96,6 +108,10 @@ def main():
         f.write('void erxRegisterModuleFunctions()\n{\n')
         for name in sorted(decls, key=lambda n: (decls[n], n)):
             f.write(f'    PS2Runtime::registerOverflowFunction(0x{decls[name]:08X}u, {name});\n')
+        starts = set(decls.values())
+        for ra in sorted(resume):
+            if ra not in starts:
+                f.write(f'    PS2Runtime::registerOverflowFunction(0x{ra:08X}u, {resume[ra]}); // resume\n')
         f.write('}\n')
 
     print(f'{len(modules)} modules: {copied} function files, {len(decls)} registrations -> {out_dir}')

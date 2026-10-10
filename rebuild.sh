@@ -5,11 +5,14 @@
 # Order from a clean checkout: ./setup.sh (builds tools/PS2Recomp) -> ./rebuild.sh.
 set -euo pipefail
 root=$(cd "$(dirname "$0")" && pwd)
-tools=$root/tools/PS2Recomp
+# PS2X_TOOLS: PS2Recomp checkout to build into (default tools/PS2Recomp); the recompiler binary
+# always comes from tools/PS2Recomp unless PS2X_RECOMP is set.
+tools=${PS2X_TOOLS:-$root/tools/PS2Recomp}
+recomp=${PS2X_RECOMP:-$root/tools/PS2Recomp/build/ps2xRecomp/ps2_recomp}
 erx=$root/erx
 cd "$root/work"
 rm -rf output
-"$tools/build/ps2xRecomp/ps2_recomp" ufe3.toml > recomp.log 2>&1
+"$recomp" ufe3.toml > recomp.log 2>&1
 # Only generated files are replaced; game-specific sources come from game/.
 find "$tools/ps2xRuntime/src/runner" -not -path '*/erx/*' \( -name 'sub_*.cpp' -o -name 'entry_*.cpp' -o -name 'register_functions.cpp' -o -name 'ufe3_*.cpp' \) -delete
 cp output/*.cpp "$tools/ps2xRuntime/src/runner/"
@@ -27,7 +30,7 @@ fi
 step2_stamp=$erx/step2/out/erx_register.cpp
 need_erx=0
 [ -f "$step2_stamp" ] || need_erx=1
-for f in "$erx"/step2/*.py "$erx/out/manifest.json" "$tools/build/ps2xRecomp/ps2_recomp"; do
+for f in "$erx"/step2/*.py "$erx/out/manifest.json" "$recomp"; do
     if [ "$f" -nt "$step2_stamp" ]; then need_erx=1; fi
 done
 if [ "$need_erx" = 1 ]; then
@@ -37,7 +40,7 @@ if [ "$need_erx" = 1 ]; then
     rm -rf "$erx/step2/gen"
     python3 "$erx/step2/erx_wrap.py" --root "$root"
     for m in "$erx"/step2/cfg/*.toml; do
-        "$tools/build/ps2xRecomp/ps2_recomp" "$m" >> "$erx/step2/recomp_erx.log" 2>&1
+        "$recomp" "$m" >> "$erx/step2/recomp_erx.log" 2>&1
     done
     python3 "$erx/step2/erx_post.py" --root "$root"
 fi
