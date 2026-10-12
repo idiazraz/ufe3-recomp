@@ -30,3 +30,7 @@ build/
 # Extracted movies / reference frames are game content
 *.ipu
 /work/ipu_ref/ref_movie*/
+
+# VU1 AOT output is derived from game micro code (regenerate with vu1aot/vu1aot.py)
+/vu1aot/out/
+/game/ufe3_vu1_aot.cpp

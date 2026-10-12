@@ -17,6 +17,14 @@ rm -rf output
 find "$tools/ps2xRuntime/src/runner" -not -path '*/erx/*' \( -name 'sub_*.cpp' -o -name 'entry_*.cpp' -o -name 'register_functions.cpp' -o -name 'ufe3_*.cpp' \) -delete
 cp output/*.cpp "$tools/ps2xRuntime/src/runner/"
 cp "$root"/game/*.cpp "$tools/ps2xRuntime/src/runner/"
+# VU1 AOT (see vu1aot/vu1aot.py): compile the dumped VU1 micro code images, if any
+# (dump them with PS2X_VU1_DUMP_DIR=$root/vu1aot/images; enable with PS2X_VU1_AOT=1).
+rm -f "$tools/ps2xRuntime/src/runner/ufe3_vu1_aot.cpp"
+if compgen -G "$root/vu1aot/images/*.bin" > /dev/null; then
+    mkdir -p "$root/vu1aot/out"
+    python3 "$root/vu1aot/vu1aot.py" "$root/vu1aot/out/ufe3_vu1_aot.cpp" "$root"/vu1aot/images/*.bin
+    cp "$root/vu1aot/out/ufe3_vu1_aot.cpp" "$tools/ps2xRuntime/src/runner/"
+fi
 cp output/*.h "$tools/ps2xRuntime/include/"
 
 # --- ERX module support (steps 1-3) ------------------------------------------
