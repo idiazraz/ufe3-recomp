@@ -219,3 +219,153 @@ real end transition — then verify 0x13 → next scene with a pad script.
 The fake-playback hook on 0x32CB48 (advance obj+0x134 per frame) was tested in a 100 s headless run with button presses:
 the pump state at 0x412BAC stayed 6 and the scene stayed 0x13, so it was removed. The title waits for its background
 movie to really play/end; next step is a real IPU decoder (port of PCSX2's IPU core into PS2Recomp).
+
+## Finding 12 — Movie player 0x412AD0 field map (exact code + live peeks)
+
+Getters are methods on the same object (sub_0032CAD8 passes one base to both):
+- `sub_0032C9F8` "total": `ptr = *(obj+0); return *(u32*)(ptr+0xC)` — obj+0 is a **stream
+  object pointer**, not a count.
+- `sub_0032CAC0` "pos": `*(s32*)(obj+0x12C) >= 0 ? that : *(obj+0x134)` — 0x12C is the
+  in-flight decode position, 0x134 the idle/fallback position.
+- `sub_0032CAD8` "movie ended?" = `pos == total-2` (xor/sltiu equality, returns 0/1).
+- `sub_0032CB48` "active" = `*(u8*)(obj+0xE6)`.
+- `sub_0032B930(obj, a1, a2, a3)` = arm: `+0xD0 = a1` (frame count), `+0x12C = -1`,
+  `+0xD8 = a2` (dbp), `+0x134 = a3` (start pos). `sub_0032B5B0` sets +0xE6 = 1.
+- `sub_0032B5C0` = **stop/teardown**, not per-frame update: loops i<4 waiting on
+  `func_32F5C8(0x4BD000, *(obj+0xFC+4i)) != 0` (busy-wait at 0x32b618..0x32b620 — the
+  stall point without IPU DMA completion), frees 6 buffers (obj+0,+4..+0x30 via
+  func_3315E8), then `+0xE6 = 0`, `+0x138 = -1`.
+- Stream object (title): magic "ipum" (0x6D757069) at +0, `+0xC = 0x708 = 1800`
+  (= total used by the ended query).
+
+## Finding 13 — Title state: armed but never stepped (run_t5, 2 s peeks)
+
+At scene 0x13 the player is **frozen across all dumps**: `+0x12C = -1`, `+0x134 = 0`
+(so pos getter = 0), `+0xE6 = 0`, `+0xD0 = 0x79 (121)`, `+0xD8 = 0x1184 (dbp)`,
+`+0x138 = 1`, `+0xD4 = 0`, `+0xDC = 6`. During OPENING (scene 4) the same object is
+live: `+0x12C = 0x1d/0x1e` (advances even with no button), `+0xD0 = 0x84 (132)`,
+`+0xD4 = 1`. So at the title the movie is armed (0x32B930 ran) but **no frame is ever
+decoded/advanced**: the title is waiting on the movie player to finish.
+
+## Finding 14 — Where it stalls: the movie loop sub_00231F48 has no exit without IPU
+
+`sub_00231F48` = the movie scene's main loop ("CMovieScene::Play"): entry check
+`func_2320C0() == 0 -> return -1`, then a per-iteration body (0x231fc8..0x232084:
+pad read func_354A80(0x42E580), sceDmaGetChan, render double-buffer 0x34ED50/0x34EE18,
+sceGsSyncPath 0x35BC98, movie step 0x34F430, `sub_0032CB48` active check and
+`if (active) sub_0032B5C0` teardown, DMA-manager polls 0x32F9C0/0x32EFB8/0x32EE20,
+0x355DC8) ending in `b 0x231fc8`. **The loop body contains no branch that exits** —
+the only way out is a pending "movie action" slot `gp-0x7930`, consumed once per
+iteration by `sub_00231F10` (tail-calls `func_279AB0(slot)`) and cleared by
+`sub_00231F40`; the slot is set only by `sub_00231F08(value)` (registered by the
+movie-scene setup). With no IPU the movie never reaches its end, the end/skip path
+never arms gp-0x7930, and the scene parks in this loop forever — which is exactly why
+the title's input decider (sub_003268D0, Finding 5/8) never runs: it lives outside
+this loop. The same loop is used by the OPENING; there a button press exits through
+the game's own skip path (known facts).
+
+## Finding 15 — What "movie end" is hooked to
+
+Callers of `sub_0032CAD8` (ended query) are the movie wrappers only (0x200270,
+0x21BA40, 0x26DCF8, 0x286E18, 0x2895B0, 0x2B83B8) — none in the 0x326/0x327 title
+family. The loop itself never queries "ended"; the end/skip notification reaches the
+loop via the gp-0x7930 action slot (Finding 11). The end condition the wrappers use
+is `pos == total-2` (title: total = 1800).
+
+## Finding 16 — Fake playback v1 (0x32CB48 getter tick) — implemented, superseded
+
+Implemented the smallest fake playback as a runtime hook on `sub_0032CB48` (0x0032CB48)
+— called exactly once per movie-loop iteration via a real JAL from sub_00231F48, so
+`runtime.replaceFunction` intercepts it (the SOUNDMAN hooks use the same mechanism):
+each call advances `obj+0x134` by one frame (video rate) while `+0x12C < 0` (no real
+decode in flight), capped at `*(stream+0xC) - 2` so `sub_0032CAD8` reports "ended" at
+the last frame exactly as hardware does; the original `+0xE6` return is preserved.
+Rebuilt (`nice -n 19 ./rebuild.sh`, clean).
+Verification (run_t6, 50 s, opening skipped with circle@420-430,circle@480-490 and
+button presses at the title): the fake playback is **live** — `+0x134` advances
+steadily at ~56 frames/s (dumps: 0xc0, 0x131, 0x1a2, 0x214, 0x285, 0x2f7, 0x369,
+0x3db, 0x44b, 0x4bd, 0x52e, 0x59e, 0x610, 0x681...) with `+0x12C` staying -1, and
+the stream object resolves to the "ipum" header with total = 1800 (the cap target).
+**Not yet verified**: that the title leaves 0x13 (or shows the menu) once the counter
+reaches 1798 and a button is pressed — run_t7/t8 were cut short: PNG capture with a
+relative PS2X_SHOT_DIR failed ("Failed to open file"), and two run_t8 attempts failed
+on environmental collisions ("Permission denied" executing ps2EntryRunner while a
+*concurrent, non-session* `cmake --build --target ps2EntryRunner` was relinking it at
+21:48, then a stale /run/user/1000/ufe3-headless.lock from the killed attempt). The
+pending check: rerun (absolute PS2X_SHOT_DIR, ~75 s, presses after the counter passes
+1798) and confirm the scene word changes or the menu appears in the PNGs.
+**Superseded** by Finding 17: the concurrent review session tested this getter-level
+tick in a 100 s run — the pump state (+0xDC) stayed 6 and the scene stayed 0x13, and
+removed the hook. Advancing the position alone cannot unstick the title because its
+wait is gated on the *pump poll's return value* (sub_0032B968), not on the position.
+
+## Finding 17 — Fake playback v2: hook the movie PUMP POLL (0x32B968), not the getter
+
+Target chosen from the concurrent review's Finding 10/11 (the proven-blocking gate):
+the title's state-2 body (sub_00326AF0 at 0x326D38) advances to the input state iff
+`sub_0032F618(0x4BD000) != 0 && sub_0032B968(0x412AD0, 0) == 0 && sub_00357000(0x4BD228) == 0`,
+and `sub_0032B968` (the movie player's pump poll, 12 real JAL call sites —
+replaceFunction intercepts them; sub_0032B950 has no JAL callers and is left bound to
+the real tail call) is stuck returning 1 because pump state +0xDC == 6 whose handler
+sub_0032BCA8 returns 1 unconditionally.
+Implementation (game/ufe3_overrides.cpp, `ufe3MoviePumpTick` bound at 0x0032B968):
+- no stream object (obj+0 == 0) -> return 0 (idle, no movie);
+- stream present but header magic "ipum" (0x6D757069) not yet parsed (movie file
+  still loading, total undefined) -> return 1 (busy), as hardware would;
+- otherwise fake frames: while the real decode path is idle (obj+0x12C < 0) advance
+  obj+0x134 by 1 per poll (video rate; blank frames already shown on the movie plane),
+  capped at total-2 with total = *(stream+0xC) = 1800 for the title movie;
+- return 1 ("playing") until pos >= total-2, then 0 ("idle") = the game's own
+  end-of-movie value (sub_0032CAD8 semantics), so the state-2 gate closes through the
+  game's normal path and the title reaches its input state (5).
+Verification pending the rebuild + headless run.
+
+## Finding 18 — Pump-poll replacement breaks the movie pipeline (v2/v3 of the fix)
+
+Replacing sub_0032B968 (the pump poll) itself is wrong: the pump is not a pure query —
+the movie file load (stream object 0x67CE80, "ipum" header, total 1800) and the frame
+pipeline only progress while the REAL pump code runs. With the poll replaced (v2/v3,
+run_t9/t11/t13) the stream object stays empty/zeroed and nothing ever plays; with the
+poll left real (v4) the load completes and the movie plays. (In pump state 6 the
+handler sub_0032BCA8 does return 1 with no side effects, but the other states are the
+pipeline driver.) Also verified: pump state out of range (>= 7 or negative, e.g. the
+reset value -1 written by sub_0032B3D8) takes sub_0032B980's default path at 0x32b9e4
+which **returns 0 ("idle")** — the value the title's state-2 gate needs.
+
+## Finding 19 — v4/v5 fake playback: the movie plays AND ends (verified)
+
+Final implementation in game/ufe3_overrides.cpp (built into the runner):
+- `ufe3MovieActiveQuery` @ 0x0032CB48 (once per frame from the movie loop): advances
+  the movie position by one frame per video tick (obj+0x134 while the real decode path
+  is idle, obj+0x12C < 0) toward total-2 = 1798; at the end pokes the pump state
+  obj+0xDC = -1 so the REAL sub_0032B968 poll reports idle (Finding 18).
+- `ufe3MovieAudioStreamBusy` @ 0x00356AF8 (SOUNDMAN cmd 0x22 thunk, only caller is the
+  gate's predicate-C helper sub_00357000): reports "stream busy" while the movie plays
+  and "stopped" once it ends. This is what unsticks the REAL pipeline: with the audio
+  reported active the game's own decoder loop starts delivering frames — run_t16/t17:
+  obj+0x12C (real decode position) advances 542 -> 723 -> 923 -> ... -> 1798 with pump
+  state 6, and at total-2 the position wraps to 0 (the attract movie restarts) —
+  exactly hardware-like blank-frame playback at the runtime's frame rate.
+- Predicate A (sub_0032F618(0x4BD000)): live counters gp+0x2AFC == gp+0x2B00 ==
+  0x87 (gp = 0x4BAD70 from ELF .reginfo) => passes. B/C pass per the hooks above.
+
+## Finding 20 — Title reaches its interactive state and accepts a button press (verified)
+
+Title object = *(gp+0x2ABC) = 0x67CE00 (peeked via PS2X_EE_PEEK deref). Live state byte
+(+0x34): 2 (wait) during the movie, then **5 (input)** for 8 consecutive dumps
+(~2 min) while the attract movie keeps playing, then 7. A scripted button press during
+state 5 is **accepted**: obj+0x35 = 1, obj+0x36 = 1 (flag), obj+0x38 = 0 (picked flow
+entry) — the title's decider (sub_003268D0) ran and state 5 -> 6 -> 7 fired
+sub_00327100 -> sub_00326458 -> sub_0032FCB8(taskmgr, entry+4).
+**Next scene id = 7** (flow entry 0's +4 field, Finding 4's table: entries 0/1/4/5/6
+-> scene 7 "----" special sub-scene, dispatched through 0x282020(*(0x4B4690), ...)).
+Gotcha for future runs: PS2X_PAD_SCRIPT ticks advance only ~2.3/s of wall time in this
+runtime (a 950 s run reaches tick ~2186), so scripts must target ticks < ~2200 for a
+< 1000 s run (the opening-skip presses at 420/480 and input presses at 600-2200 are
+the working range).
+Remaining gap (next step): after the request for scene 7 the scene word 0x42AB5C stays
+0x13 — the scene-7 sub-scene dispatch (0x282020 + its loader) is the next thing to
+investigate; it may be gated on the flow slots 6/7/11 (Findings 1-4) or on its own
+load pipeline. The title's movie-driven stall itself is solved: movie plays at video
+rate with blank frames, ends through the game's own end value, the wait state closes,
+and the title accepts input.

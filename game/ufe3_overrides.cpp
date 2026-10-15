@@ -1,4 +1,6 @@
 // Ultraman Fighting Evolution 3 (SLPS-25441) runtime overrides.
+#include <cmath>
+#include <ps2_recompiled_functions.h>
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
@@ -148,6 +150,88 @@ namespace
         setReturnS32(ctx, ok ? 1 : -1);
     }
 
+    // PS2X_TRACE_CLIP: wrap the per-plane polygon clipper sub_003396D8(out=a0, in=a1, plane=a2)
+    // and report the first calls that turn finite input into huge (|x| > 1e30) output.
+    void ufe3TraceClip(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t out = getRegU32(ctx, 4), in = getRegU32(ctx, 5), plane = getRegU32(ctx, 6);
+        const uint32_t ra = getRegU32(ctx, 31);
+        auto rdf = [&](uint32_t a) { float f; std::memcpy(&f, rdram + (a & PS2_RAM_MASK), 4); return f; };
+        auto rdw = [&](uint32_t a) { uint32_t w; std::memcpy(&w, rdram + (a & PS2_RAM_MASK), 4); return w; };
+        auto huge = [&](uint32_t base, int32_t n) {
+            for (int i = 0; i < std::min<int32_t>(n, 9); ++i)
+                for (int c = 0; c < 4; ++c)
+                    if (std::fabs(rdf(base + i * 64 + c * 4)) > 1e30f)
+                        return true;
+            return false;
+        };
+        auto dump = [&](const char *tag, uint32_t base, int32_t n) {
+            for (int i = 0; i < std::min<int32_t>(n, 9); ++i)
+                std::fprintf(stderr, "[clip]   %s%d pos=(%g %g %g %g) w1=(%g %g %g %g)\n", tag, i, rdf(base + i * 64), rdf(base + i * 64 + 4),
+                             rdf(base + i * 64 + 8), rdf(base + i * 64 + 12), rdf(base + i * 64 + 32), rdf(base + i * 64 + 36), rdf(base + i * 64 + 40), rdf(base + i * 64 + 44));
+        };
+        const int32_t inCount = static_cast<int32_t>(rdw(in + 0x240));
+        const bool inHuge = huge(in, inCount);
+        sub_003396D8_0x3396d8(rdram, ctx, runtime);
+        const int32_t outCount = static_cast<int32_t>(rdw(out + 0x240));
+        static int reports = 0;
+        if (!inHuge && inCount >= 0 && inCount <= 9 && (huge(out, outCount) || outCount > 9) && reports < 4)
+        {
+            ++reports;
+            std::fprintf(stderr, "[clip] ra=%x plane=%x p=(%g %g %g %g) n=(%g %g %g %g) in n=%d out n=%d\n", ra, plane, rdf(plane), rdf(plane + 4),
+                         rdf(plane + 8), rdf(plane + 12), rdf(plane + 16), rdf(plane + 20), rdf(plane + 24), rdf(plane + 28), inCount, outCount);
+            dump("in", in, inCount);
+            dump("out", out, outCount);
+        }
+    }
+
+
+    // PS2X_TRACE_VWAIT: log each exit of the swap routine's vblank-flag wait sub_00355F38.
+    void ufe3TraceVWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        auto rdw = [&](uint32_t a) { uint32_t w; std::memcpy(&w, rdram + (a & PS2_RAM_MASK), 4); return w; };
+        const uint32_t before = rdram[(obj + 0x44) & PS2_RAM_MASK];
+        sub_00355F38_0x355f38(rdram, ctx, runtime);
+        std::fprintf(stderr, "[vwait] tick=%llu obj=%x flagBefore=%u flagAfter=%u handlerCount=%u %s\n",
+                     (unsigned long long)runtime->eeScheduler().currentVSyncTick(), obj, before,
+                     rdram[(obj + 0x44) & PS2_RAM_MASK], rdw(obj + 0x38), ctx->pc == ra ? "done" : "yield");
+    }
+
+    void ufe3TraceVHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = getRegU32(ctx, 5);
+        sub_00356638_0x356638(rdram, ctx, runtime);
+        std::fprintf(stderr, "[vhandler] tick=%llu flag=%u count=%u\n",
+                     (unsigned long long)runtime->eeScheduler().currentVSyncTick(), rdram[(obj + 0x44) & PS2_RAM_MASK],
+                     *reinterpret_cast<uint32_t *>(rdram + ((obj + 0x38) & PS2_RAM_MASK)));
+    }
+
+    void ufe3TraceLerp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t out = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        const float t = ctx->f[12];
+        auto rdf = [&](uint32_t x) { float f; std::memcpy(&f, rdram + (x & PS2_RAM_MASK), 4); return f; };
+        sub_00339648_0x339648(rdram, ctx, runtime);
+        static int reports = 0;
+        if (std::fabs(rdf(out)) > 1e30f && reports < 4)
+        {
+            ++reports;
+            std::fprintf(stderr, "[lerp] t=%g (bits %08x) ra=%x a=%x(%g %g %g %g | uv %g %g) b=%x(%g %g %g %g | uv %g %g) out=(%g %g %g %g | uv %g %g)\n", t,
+                         [&] { uint32_t w; std::memcpy(&w, &t, 4); return w; }(), getRegU32(ctx, 31), a, rdf(a), rdf(a + 4), rdf(a + 8), rdf(a + 12), rdf(a + 32), rdf(a + 36), b,
+                         rdf(b), rdf(b + 4), rdf(b + 8), rdf(b + 12), rdf(b + 32), rdf(b + 36), rdf(out), rdf(out + 4), rdf(out + 8), rdf(out + 12), rdf(out + 32), rdf(out + 36));
+            float v[4];
+            std::memcpy(v, &ctx->vu0_vf[26], 16);
+            std::fprintf(stderr, "[lerp]   vf26=(%g %g %g %g)", v[0], v[1], v[2], v[3]);
+            std::memcpy(v, &ctx->vu0_vf[27], 16);
+            std::fprintf(stderr, " vf27=(%g %g %g %g)", v[0], v[1], v[2], v[3]);
+            std::memcpy(v, &ctx->vu0_vf[16], 16);
+            std::fprintf(stderr, " vf16=(%g %g %g %g)", v[0], v[1], v[2], v[3]);
+            std::memcpy(v, &ctx->vu0_acc, 16);
+            std::fprintf(stderr, " acc=(%g %g %g %g)\n", v[0], v[1], v[2], v[3]);
+        }
+    }
+
     void ufe3SoundmanLoadDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // cmd 0x1D ("is job done?"): the load above completed synchronously.
@@ -155,6 +239,113 @@ namespace
         (void)rdram;
         (void)runtime;
         setReturnS32(ctx, 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fake movie playback (this runtime has no IPU/MPEG decoder).
+    //
+    // The game's movie player (object at 0x412AD0) is queried once per frame through
+    // sub_0032CB48 ("movie active?", a real JAL from the movie loop sub_00231F48, so
+    // replaceFunction intercepts it). On hardware the IPU decodes one picture per
+    // video frame and the player's position advances; here the IPU registers are
+    // plain storage, no picture ever completes, and the pump poll sub_0032B968 stays
+    // in its "playing" state (obj+0xDC == 6, handler sub_0032BCA8 returns 1
+    // unconditionally) forever, so movie-driven states (e.g. the title's wait state,
+    // which requires sub_0032B968(obj,0) == 0) never close.
+    //
+    // Field map (verified in the generated code):
+    //   obj+0x000 = stream object pointer; total = *(stream+0xC) (sub_0032C9F8);
+    //               the parsed movie header starts with the magic "ipum"
+    //   obj+0x12C = in-flight decode position, -1 when idle (sub_0032CAC0 returns it
+    //               when >= 0, else obj+0x134)
+    //   obj+0x134 = frame position reported when idle
+    //   obj+0x0DC = pump state: 6 = playing (returns 1), out-of-range (e.g. -1, the
+    //               value the game's own reset sub_0032B3D8 writes) makes the pump
+    //               take its default path and return 0 ("idle")
+    //   obj+0x0E6 = "active" byte this getter returns (unchanged)
+    // sub_0032CAD8 ("movie ended?") is  pos == total - 2.
+    //
+    // Fake playback: each query advances the frame position by one (video rate; the
+    // movie plane already shows blank frames) while the real decode path is idle
+    // (obj+0x12C < 0), capped at total-2. When the movie reaches that end-of-movie
+    // value, the pump state is set to the game's own "reset" value (-1) so the REAL
+    // pump poll reports idle and every movie wait state closes through its normal
+    // path (the pump's pipeline keeps running unmodified until then).
+    void ufe3MovieActiveQuery(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t obj = getRegU32(ctx, 4) & PS2_RAM_MASK;
+        auto rd32 = [&](uint32_t off) {
+            uint32_t value;
+            std::memcpy(&value, rdram + ((obj + off) & PS2_RAM_MASK), sizeof(value));
+            return value;
+        };
+        auto wr32 = [&](uint32_t off, uint32_t value) {
+            std::memcpy(rdram + ((obj + off) & PS2_RAM_MASK), &value, sizeof(value));
+        };
+
+        const uint32_t stream = rd32(0x000);
+        if (stream != 0u)
+        {
+            uint32_t magic = 0u;
+            uint32_t totalRaw = 0u;
+            std::memcpy(&magic, rdram + (stream & PS2_RAM_MASK), sizeof(magic));
+            std::memcpy(&totalRaw, rdram + ((stream + 0xCu) & PS2_RAM_MASK), sizeof(totalRaw));
+            const int32_t total = static_cast<int32_t>(totalRaw);
+            if (magic == 0x6D757069u && total > 2) // "ipum": parsed movie header
+            {
+                const int32_t inflight = static_cast<int32_t>(rd32(0x12C));
+                int32_t pos = inflight >= 0 ? inflight : static_cast<int32_t>(rd32(0x134));
+                if (inflight < 0 && pos < total - 2)
+                {
+                    pos += 1; // one fake frame per video tick
+                    wr32(0x134, static_cast<uint32_t>(pos));
+                }
+                if (pos >= total - 2 && static_cast<int32_t>(rd32(0xDC)) >= 0)
+                {
+                    // Movie played to its end: park the pump in its "reset" state so
+                    // the real sub_0032B968 poll reports idle (default path returns 0).
+                    wr32(0xDC, 0xFFFFFFFFu);
+                }
+            }
+        }
+
+        // Original semantics: lbu v0, 0xE6(a0).
+        setReturnS32(ctx, rdram[(obj + 0xE6) & PS2_RAM_MASK]);
+    }
+
+    // Movie audio-stream status: the game polls "any active SOUNDMAN stream job?"
+    // (cmd 0x22 via func_356E10) through this thunk, and the title's state-2 gate
+    // requires it to report "stopped" (predicate C: sub_00357000(0x4BD228) == 0).
+    // This runtime's SOUNDMAN never completes the movie audio-stream job, so the
+    // query reports "busy" forever. Fake: the movie's audio plays along with the
+    // fake video playback (see ufe3MovieActiveQuery) and stops when the movie ends.
+    void ufe3MovieAudioStreamBusy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t obj = 0x00412AD0u & PS2_RAM_MASK;
+        auto rd32 = [&](uint32_t off) {
+            uint32_t value;
+            std::memcpy(&value, rdram + ((obj + off) & PS2_RAM_MASK), sizeof(value));
+            return value;
+        };
+
+        bool ended = false;
+        const uint32_t stream = rd32(0x000);
+        if (stream != 0u)
+        {
+            uint32_t magic = 0u;
+            uint32_t totalRaw = 0u;
+            std::memcpy(&magic, rdram + (stream & PS2_RAM_MASK), sizeof(magic));
+            std::memcpy(&totalRaw, rdram + ((stream + 0xCu) & PS2_RAM_MASK), sizeof(totalRaw));
+            const int32_t total = static_cast<int32_t>(totalRaw);
+            const int32_t inflight = static_cast<int32_t>(rd32(0x12C));
+            const int32_t pos = inflight >= 0 ? inflight : static_cast<int32_t>(rd32(0x134));
+            ended = (magic == 0x6D757069u && total > 2 && pos >= total - 2);
+        }
+        // Busy while the movie is expected/playing (as hardware reports for a live
+        // audio stream), stopped once the movie has played to its end.
+        setReturnS32(ctx, ended ? 0 : 1);
     }
 
     // ---------------------------------------------------------------------------
@@ -690,6 +881,32 @@ namespace
             !runtime.replaceFunction(0x00356A18u, &ufe3SoundmanLoadDone))
         {
             std::cerr << "[ufe3] failed to bind SOUNDMAN load overrides" << std::endl;
+        }
+
+        if (std::getenv("PS2X_TRACE_VWAIT") != nullptr)
+        {
+            runtime.replaceFunction(0x00355F38u, &ufe3TraceVWait);
+            runtime.replaceFunction(0x00356638u, &ufe3TraceVHandler);
+        }
+        if (std::getenv("PS2X_TRACE_CLIP") != nullptr)
+        {
+            runtime.replaceFunction(0x003396D8u, &ufe3TraceClip);
+            runtime.replaceFunction(0x00339648u, &ufe3TraceLerp);
+        }
+
+        // Fake movie playback: the once-per-frame movie query advances the movie
+        // player's frame position at video rate and parks the pump in its reset state
+        // at the movie's end, so the real pump poll reports idle and movie-driven
+        // states (the title) pass their waits without a real IPU decoder.
+        if (!runtime.replaceFunction(0x0032CB48u, &ufe3MovieActiveQuery))
+        {
+            std::cerr << "[ufe3] failed to bind fake movie playback tick" << std::endl;
+        }
+        // Fake movie audio stream: reports "stopped" once the fake playback has ended
+        // so the title's state-2 gate predicate C can close (see the thunk above).
+        if (!runtime.replaceFunction(0x00356AF8u, &ufe3MovieAudioStreamBusy))
+        {
+            std::cerr << "[ufe3] failed to bind fake movie audio stream status" << std::endl;
         }
 
         // See the ERX loader above (erx/step3/README.md). The step-2 recompiler made
