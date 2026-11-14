@@ -53,6 +53,9 @@ if [ "$need_erx" = 1 ]; then
     python3 "$erx/step2/erx_post.py" --root "$root"
 fi
 # Step 3 metadata table for the game override (cheap; always regenerate).
+# build-win.sh runs erx_bindings.py once, but rebuild.sh must not depend on a
+# pre-existing erx/step2/out (that directory is gitignored and erased on clean runs).
+python3 "$erx/step2/erx_bindings.py" --root "$root"
 python3 "$erx/step3/erx_tables.py" --root "$root"
 # Wire everything into the runner (PS2X_ERX_SOURCE_DIR, see tools/PS2Recomp
 # ps2xRuntime/CMakeLists.txt): module sources in src/runner/erx/, the metadata
@@ -66,4 +69,8 @@ cp "$erx/step3/out/erx_tables.cpp" "$tools/ps2xRuntime/src/runner/"
 # when the module sources appeared after the last configure; cache flags are kept.
 cmake -S "$tools" -B "$tools/build" > /dev/null
 # ------------------------------------------------------------------------------
-cmake --build "$tools/build" --target ps2EntryRunner -j"$(nproc)" 2>&1 | grep -E ' error|FAILED' || true
+set +e
+cmake --build "$tools/build" --target ps2EntryRunner -j"$(nproc)" 2>&1 | grep -E ' error|FAILED'
+build_status=${PIPESTATUS[0]}
+set -e
+[ "$build_status" -eq 0 ]
